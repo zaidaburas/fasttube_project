@@ -1,95 +1,60 @@
-import yt_dlp
-from django.http import JsonResponse, FileResponse, HttpResponse
-from django.views.decorators.csrf import csrf_exempt
-import tempfile
-import os
+# api/views.py (مقتطف)
+from django.http import JsonResponse, StreamingHttpResponse
+from .scraper import ytdlp_get_info, ytdlp_download_to_temp, playwright_extract_player_response, extract_stream_urls_from_player, stream_via_requests
+import os, shutil
 
-
-# ============================
-# 🔥 Bypass Options
-# ============================
-YDL_BYPASS_OPTS = {
-    'geo_bypass': True,
-    'nocheckcertificate': True,
-    'youtube_include_dash_manifest': False,
-
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'android_music', 'tv'],  # Bypass Anti-bot
-        }
-    },
-
-    'http_headers': {
-        'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 13)',
-        'Accept-Language': 'en-US,en;q=0.9',
-    },
-
-    'quiet': True,
-}
-
-
-# ============================
-# 📌 API: Get Video Info
-# ============================
-def get_info(request):
-    url = request.GET.get("url")
+def info_view(request):
+    url = request.GET.get('url')
     if not url:
-        return JsonResponse({'success': False, 'error': 'Missing URL'})
-
+        return JsonResponse({'success': False, 'error': 'Missing url param'}, status=400)
     try:
-        with yt_dlp.YoutubeDL(YDL_BYPASS_OPTS) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        return JsonResponse({
-            'success': True,
-            'video_id': info.get('id'),
-            'title': info.get('title'),
-            'author': info.get('channel'),
-            'channel_id': info.get('channel_id'),
-            'duration': info.get('duration'),
-            'view_count': info.get('view_count'),
-            'like_count': info.get('like_count'),
-            'thumbnail': info.get('thumbnail'),
-            'description': info.get('description'),
-            'formats': info.get('formats'),
-        })
-
+        info = ytdlp_get_info(url)  # try yt-dlp first
+        return JsonResponse({'success': True, 'info': info})
     except Exception as e:
-        return JsonResponse({'success': False, 'error': str(e)})
+        # fallback playwright
+        try:
+            player = playwright_extract_player_response(url)
+            streams = extract_stream_urls_from_player(player)
+            return JsonResponse({'success': True, 'info': {'player': player, 'streams': streams}})
+        except Exception as e2:
+            return JsonResponse({'success': False, 'error': str(e), 'fallback_error': str(e2)}, status=500)
 
-
-# ============================
-# 📌 API: Download Video
-# ============================
-@csrf_exempt
-def download(request):
-    url = request.GET.get("url")
-    quality = request.GET.get("quality", "best")
-
+def info_view(request):
+    url = request.GET.get('url')
     if not url:
-        return JsonResponse({'success': False, 'error': 'Missing URL'})
-
-    # تخزين مؤقت للملف
-    temp_dir = tempfile.mkdtemp()
-    output_path = os.path.join(temp_dir, "%(title)s.%(ext)s")
-
-    ydl_opts = YDL_BYPASS_OPTS.copy()
-    ydl_opts.update({
-        'format': f'bestvideo[height<={quality}]+bestaudio/best' if quality != "best" else 'best',
-        'outtmpl': output_path,
-    })
-
+        return JsonResponse({'success': False, 'error': 'Missing url param'}, status=400)
+    # try yt-dlp download to temp file
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        filepath = ytdlp_download_to_temp(url, format_selector='best')
+        filename = os.path.basename(filepath)
+        def file_iterator(path):
+            with open(path, 'rb') as f:
+                while True:
+                    chunk = f.read(1024*64)
+                    if not chunk:
+                        break
+                    yield chunk
+            # cleanup after streaming
+            try:
+                shutil.rmtree(os.path.dirname(path))
+            except Exception:
+                pass
 
-        final_path = ydl.prepare_filename(info)
-
-        # إعادة الملف للمتصفح
-        return FileResponse(open(final_path, 'rb'),
-                            as_attachment=True,
-                            filename=os.path.basename(final_path))
-
+        resp = StreamingHttpResponse(file_iterator(filepath), content_type='application/octet-stream')
+        resp['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return resp
     except Exception as e:
-        return JsonResponse({'success': False, 'error': str(e)})
-
+        # fallback: try playwright -> direct stream
+        try:
+            player = playwright_extract_player_response(url)
+            streams = extract_stream_urls_from_player(player)
+            if not streams:
+                raise RuntimeError('No direct streams found in player JSON')
+            # pick best video+audio or the first available
+            direct = streams[0]['url']
+            generator = stream_via_requests(direct)
+            resp = StreamingHttpResponse(generator, content_type='video/mp4')
+            resp['Content-Disposition'] = 'attachment; filename="video.mp4"'
+            return resp
+        except Exception as e2:
+            return JsonResponse({'success': False, 'error': str(e), 'fallback_error': str(e2)}, status=500)
