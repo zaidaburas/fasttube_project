@@ -2,4 +2,5 @@ Django>=4.2
 yt-dlp>=2025.11.0
 django-cors-headers>=3.13.0
 gunicorn>=20.1.0
+playwright>=1.40.0
 requests
